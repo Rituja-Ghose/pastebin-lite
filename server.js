@@ -5,7 +5,6 @@ const path = require('path');
 const { kv } = require('@vercel/kv');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(bodyParser.json());
@@ -25,116 +24,127 @@ function getNow(req) {
 // Health check
 app.get('/api/healthz', async (req, res) => {
   try {
-    await kv.ping();
+    // Simple KV operation instead of ping (more reliable)
+    await kv.set('healthcheck', 'ok', { ex: 5 });
     res.json({ ok: true });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ ok: false });
   }
 });
 
 // Create a paste
 app.post('/api/pastes', async (req, res) => {
-  const { content, ttl_seconds, max_views } = req.body;
+  try {
+    const { content, ttl_seconds, max_views } = req.body;
 
-  if (!content || typeof content !== 'string') {
-    return res.status(400).json({ error: 'Content is required' });
+    if (!content || typeof content !== 'string') {
+      return res.status(400).json({ error: 'Content is required' });
+    }
+    if (ttl_seconds && (!Number.isInteger(ttl_seconds) || ttl_seconds < 1)) {
+      return res.status(400).json({ error: 'ttl_seconds must be >= 1' });
+    }
+    if (max_views && (!Number.isInteger(max_views) || max_views < 1)) {
+      return res.status(400).json({ error: 'max_views must be >= 1' });
+    }
+
+    const id = uuidv4();
+    const now = Date.now();
+    const expires_at = ttl_seconds ? now + ttl_seconds * 1000 : null;
+
+    const pasteData = {
+      content,
+      expires_at: expires_at ? String(expires_at) : '',
+      remaining_views: max_views !== undefined ? String(max_views) : '',
+      created_at: String(now),
+    };
+
+    await kv.hset(`paste:${id}`, pasteData);
+
+    if (ttl_seconds) {
+      await kv.expire(`paste:${id}`, ttl_seconds);
+    }
+
+    res.json({
+      id,
+      url: `${req.protocol}://${req.get('host')}/p/${id}`,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
   }
-  if (ttl_seconds && (!Number.isInteger(ttl_seconds) || ttl_seconds < 1)) {
-    return res.status(400).json({ error: 'ttl_seconds must be >= 1' });
-  }
-  if (max_views && (!Number.isInteger(max_views) || max_views < 1)) {
-    return res.status(400).json({ error: 'max_views must be >= 1' });
-  }
-
-  const id = uuidv4();
-  const now = Date.now();
-  const expires_at = ttl_seconds ? now + ttl_seconds * 1000 : null;
-
-  const pasteData = {
-    id,
-    content,
-    expires_at,
-    remaining_views: max_views ?? null,
-    created_at: now,
-  };
-
-  // Store in Redis
-  await kv.hset(`paste:${id}`, pasteData);
-
-  // Set TTL if provided
-  if (ttl_seconds) {
-    await kv.expire(`paste:${id}`, ttl_seconds);
-  }
-
-  res.json({
-    id,
-    url: `${req.protocol}://${req.get('host')}/p/${id}`,
-  });
 });
 
 // Fetch paste (API)
 app.get('/api/pastes/:id', async (req, res) => {
-  const id = req.params.id;
-  const now = getNow(req);
+  try {
+    const id = req.params.id;
+    const now = getNow(req);
 
-  const paste = await kv.hgetall(`paste:${id}`);
-  if (!paste || !paste.content) {
-    return res.status(404).json({ error: 'Paste not found' });
+    const paste = await kv.hgetall(`paste:${id}`);
+    if (!paste || !paste.content) {
+      return res.status(404).json({ error: 'Paste not found' });
+    }
+
+    const expiresAt = paste.expires_at ? Number(paste.expires_at) : null;
+    const remainingViews =
+      paste.remaining_views !== '' ? Number(paste.remaining_views) : null;
+
+    if (
+      (expiresAt && now > expiresAt) ||
+      (remainingViews !== null && remainingViews <= 0)
+    ) {
+      return res.status(404).json({ error: 'Paste unavailable' });
+    }
+
+    if (remainingViews !== null) {
+      await kv.hincrby(`paste:${id}`, 'remaining_views', -1);
+    }
+
+    res.json({
+      content: paste.content,
+      remaining_views:
+        remainingViews !== null ? remainingViews - 1 : null,
+      expires_at: expiresAt ? new Date(expiresAt).toISOString() : null,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
   }
-
-  if (
-    (paste.expires_at && now > Number(paste.expires_at)) ||
-    (paste.remaining_views !== null && Number(paste.remaining_views) <= 0)
-  ) {
-    return res.status(404).json({ error: 'Paste unavailable' });
-  }
-
-  // Decrement remaining views
-  if (paste.remaining_views !== null) {
-    await kv.hincrby(`paste:${id}`, 'remaining_views', -1);
-  }
-
-  res.json({
-    content: paste.content,
-    remaining_views:
-      paste.remaining_views !== null
-        ? Number(paste.remaining_views) - 1
-        : null,
-    expires_at: paste.expires_at
-      ? new Date(Number(paste.expires_at)).toISOString()
-      : null,
-  });
 });
 
 // View paste (HTML)
 app.get('/p/:id', async (req, res) => {
-  const id = req.params.id;
-  const now = getNow(req);
+  try {
+    const id = req.params.id;
+    const now = getNow(req);
 
-  const paste = await kv.hgetall(`paste:${id}`);
-  if (!paste || !paste.content) {
-    return res.status(404).send('Paste not found');
+    const paste = await kv.hgetall(`paste:${id}`);
+    if (!paste || !paste.content) {
+      return res.status(404).send('Paste not found');
+    }
+
+    const expiresAt = paste.expires_at ? Number(paste.expires_at) : null;
+    const remainingViews =
+      paste.remaining_views !== '' ? Number(paste.remaining_views) : null;
+
+    if (
+      (expiresAt && now > expiresAt) ||
+      (remainingViews !== null && remainingViews <= 0)
+    ) {
+      return res.status(404).send('Paste unavailable');
+    }
+
+    if (remainingViews !== null) {
+      await kv.hincrby(`paste:${id}`, 'remaining_views', -1);
+    }
+
+    res.render('paste', { content: paste.content });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Server error');
   }
-
-  if (
-    (paste.expires_at && now > Number(paste.expires_at)) ||
-    (paste.remaining_views !== null && Number(paste.remaining_views) <= 0)
-  ) {
-    return res.status(404).send('Paste unavailable');
-  }
-
-  if (paste.remaining_views !== null) {
-    await kv.hincrby(`paste:${id}`, 'remaining_views', -1);
-  }
-
-  res.render('paste', { content: paste.content });
 });
 
+// IMPORTANT: export app for Vercel (NO app.listen)
 module.exports = app;
-
-// Local run
-if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-  });
-}
