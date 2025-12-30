@@ -1,8 +1,8 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const db = require('./database');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
+const { kv } = require('@vercel/kv');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -23,15 +23,17 @@ function getNow(req) {
 /* ====== ROUTES ====== */
 
 // Health check
-app.get('/api/healthz', (req, res) => {
-  db.get('SELECT 1', (err) => {
-    if (err) return res.status(500).json({ ok: false });
+app.get('/api/healthz', async (req, res) => {
+  try {
+    await kv.ping();
     res.json({ ok: true });
-  });
+  } catch (err) {
+    res.status(500).json({ ok: false });
+  }
 });
 
 // Create a paste
-app.post('/api/pastes', (req, res) => {
+app.post('/api/pastes', async (req, res) => {
   const { content, ttl_seconds, max_views } = req.body;
 
   if (!content || typeof content !== 'string') {
@@ -47,69 +49,92 @@ app.post('/api/pastes', (req, res) => {
   const id = uuidv4();
   const now = Date.now();
   const expires_at = ttl_seconds ? now + ttl_seconds * 1000 : null;
-  const remaining_views = max_views || null;
 
-  db.run(
-    `INSERT INTO pastes (id, content, expires_at, max_views, remaining_views, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-    [id, content, expires_at, max_views, remaining_views, now],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({
-        id,
-        url: `${req.protocol}://${req.get('host')}/p/${id}`,
-      });
-    }
-  );
+  const pasteData = {
+    id,
+    content,
+    expires_at,
+    remaining_views: max_views ?? null,
+    created_at: now,
+  };
+
+  // Store in Redis
+  await kv.hset(`paste:${id}`, pasteData);
+
+  // Set TTL if provided
+  if (ttl_seconds) {
+    await kv.expire(`paste:${id}`, ttl_seconds);
+  }
+
+  res.json({
+    id,
+    url: `${req.protocol}://${req.get('host')}/p/${id}`,
+  });
 });
 
 // Fetch paste (API)
-app.get('/api/pastes/:id', (req, res) => {
+app.get('/api/pastes/:id', async (req, res) => {
   const id = req.params.id;
   const now = getNow(req);
 
-  db.get('SELECT * FROM pastes WHERE id = ?', [id], (err, row) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    if (!row) return res.status(404).json({ error: 'Paste not found' });
+  const paste = await kv.hgetall(`paste:${id}`);
+  if (!paste || !paste.content) {
+    return res.status(404).json({ error: 'Paste not found' });
+  }
 
-    if ((row.expires_at && now > row.expires_at) ||
-        (row.remaining_views !== null && row.remaining_views <= 0)) {
-      return res.status(404).json({ error: 'Paste unavailable' });
-    }
+  if (
+    (paste.expires_at && now > Number(paste.expires_at)) ||
+    (paste.remaining_views !== null && Number(paste.remaining_views) <= 0)
+  ) {
+    return res.status(404).json({ error: 'Paste unavailable' });
+  }
 
-    // Decrement remaining_views if limited
-    if (row.remaining_views !== null) {
-      db.run('UPDATE pastes SET remaining_views = remaining_views - 1 WHERE id = ?', [id]);
-    }
+  // Decrement remaining views
+  if (paste.remaining_views !== null) {
+    await kv.hincrby(`paste:${id}`, 'remaining_views', -1);
+  }
 
-    res.json({
-      content: row.content,
-      remaining_views: row.remaining_views !== null ? row.remaining_views - 1 : null,
-      expires_at: row.expires_at ? new Date(row.expires_at).toISOString() : null,
-    });
+  res.json({
+    content: paste.content,
+    remaining_views:
+      paste.remaining_views !== null
+        ? Number(paste.remaining_views) - 1
+        : null,
+    expires_at: paste.expires_at
+      ? new Date(Number(paste.expires_at)).toISOString()
+      : null,
   });
 });
 
 // View paste (HTML)
-app.get('/p/:id', (req, res) => {
+app.get('/p/:id', async (req, res) => {
   const id = req.params.id;
   const now = getNow(req);
 
-  db.get('SELECT * FROM pastes WHERE id = ?', [id], (err, row) => {
-    if (err) return res.status(500).send('Server error');
-    if (!row) return res.status(404).send('Paste not found');
+  const paste = await kv.hgetall(`paste:${id}`);
+  if (!paste || !paste.content) {
+    return res.status(404).send('Paste not found');
+  }
 
-    if ((row.expires_at && now > row.expires_at) ||
-        (row.remaining_views !== null && row.remaining_views <= 0)) {
-      return res.status(404).send('Paste unavailable');
-    }
+  if (
+    (paste.expires_at && now > Number(paste.expires_at)) ||
+    (paste.remaining_views !== null && Number(paste.remaining_views) <= 0)
+  ) {
+    return res.status(404).send('Paste unavailable');
+  }
 
-    // Decrement remaining_views if limited
-    if (row.remaining_views !== null) {
-      db.run('UPDATE pastes SET remaining_views = remaining_views - 1 WHERE id = ?', [id]);
-    }
+  if (paste.remaining_views !== null) {
+    await kv.hincrby(`paste:${id}`, 'remaining_views', -1);
+  }
 
-    res.render('paste', { content: row.content });
-  });
+  res.render('paste', { content: paste.content });
 });
 
 module.exports = app;
+
+// Local run
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
